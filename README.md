@@ -680,8 +680,6 @@ All compiler intermediate objects (`.o`, `.cmd`, `.mod.o`, `.symvers`, `.order`)
 
 Driver version is `7`. All v2–v6 structs and ioctls are unchanged and keep working; new callers should gate the section 6–9 interfaces on `INT3_IOC_VERSION >= 3`, the sections 10–11 interfaces on `INT3_IOC_VERSION >= 4`, the sections 12–17 interfaces on `INT3_IOC_VERSION >= 5`, the sections 18–19 interfaces on `INT3_IOC_VERSION >= 6`, and section 20 on `INT3_IOC_VERSION >= 7` (or, preferably, on `INT3_IOC_CAPS` bits).
 
-There is deliberately no protection-change (`mprotect`) operation: the kernel exports no remote-mprotect machinery to loadable modules (`mprotect_fixup`, `change_protection` and `do_mprotect_pkey` are all unexported; the latter is static), so an in-driver reimplementation would be version-locked fragility rather than a stable interface.
-
 ---
 
 ## DKMS Setup
