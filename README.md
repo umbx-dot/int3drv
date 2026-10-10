@@ -1,151 +1,6 @@
-# int3drv — High-Performance Privileged Remote Memory Kernel Driver
+# int3drv
 
-`int3drv` is a high-performance Linux kernel character device driver (`/dev/int3`) engineered for high-throughput, low-latency remote memory access, binary instrumentation, and dynamic analysis.
-
-It is designed as an ultra-fast drop-in acceleration layer for memory analysis frameworks, reversing tools, debuggers, and game introspection utilities.
-
----
-
-## Key Advantages Over Standard Linux Interfaces
-
-| Feature | Standard `process_vm_*` / `ptrace` | `int3drv` Kernel Driver |
-| :--- | :--- | :--- |
-| **Call Overhead** | 1 syscall per operation or vector | 1 ioctl per batch of 256 operations |
-| **Discovery Hot Path** | 256 syscalls for 256 pointer reads | **1 syscall + 1 task lookup** |
-| **Scalar Access** | Requires userspace bounce pointers | **Zero-allocation direct scalar register read/write** |
-| **Pattern Scanning** | Must stream gigabytes of memory to userspace | **In-kernel sliding window scanner with hardware prefetch** |
-| **Executable/RO Patching** | Blocked on read-only pages without `mprotect` | **Privileged `FOLL_FORCE` write bypassing page protections** |
-| **VMA Region Lookup** | Parse text `/proc/<pid>/maps` via VFS | **Sub-microsecond direct kernel VMA tree query (`vma_lookup`)** |
-| **Tracer Collisions** | Blocked if another tracer (e.g. anti-debug) attaches | **Operates via kernel page tables, bypassing ptrace restrictions** |
-
----
-
-## Architecture & Codebase Layout
-
-The project enforces clean architecture where every file has a single, well-defined responsibility:
-
-```
-int3-kernel/
-├── build.sh                 # Complete build automation script (chmod +x)
-├── run.sh                   # Driver loader and command runner (chmod +x)
-├── test.sh                  # Verification suite runner: build check, selftest, live smoke (chmod +x)
-├── Makefile                 # Top-level make interface (supports DKMS)
-├── dkms.conf                # Dynamic Kernel Module Support configuration
-├── RULES.md                 # Agent rules, Ponytail doctrine, and C23 guidelines
-├── README.md                # Technical documentation and UAPI reference
-├── include/
-│   └── int3drv.h            # Canonical UAPI header (shared with userspace)
-├── src/
-│   ├── int3_internal.h      # Driver internal declarations and assertions
-│   ├── init/
-│   │   ├── device.c         # miscdevice registration and file operations table
-│   │   └── module.c         # Module lifecycle (module_init / module_exit)
-│   ├── core/
-│   │   ├── context.c        # File descriptor context allocation and bounce buffer
-│   │   ├── resolve.c        # Process resolution and task struct pinning
-│   │   ├── validate.c       # Address boundaries and arithmetic wrap checks
-│   │   └── dispatch.c       # Unlocked ioctl routing and session commands
-│   ├── mem/
-│   │   ├── copy_read.c      # Chunked remote-to-user read engine
-│   │   ├── copy_write.c     # Chunked user-to-remote write engine
-│   │   ├── rw.c             # Single-operation read/write handlers
-│   │   ├── write_verify.c   # Write with in-kernel readback comparison
-│   │   └── batch.c          # Multi-operation batch execution engine
-│   └── ops/
-│       ├── scalar.c         # Zero-allocation 32-bit and 64-bit scalar access
-│       ├── deref.c          # Single-level remote pointer dereference plus displacement
-│       ├── chain.c          # Multi-level pointer chain resolution
-│       ├── probe.c          # Non-destructive address accessibility probe
-│       ├── scan.c           # In-kernel sliding window pattern scanner
-│       ├── scan_all.c       # Multi-match strided pattern scanner
-│       ├── vscan.c          # In-kernel integer value scanner (eq/ne/gt/lt)
-│       ├── cksum.c          # In-kernel range checksum (FNV-1a)
-│       ├── copy.c           # In-kernel remote-to-remote copy
-│       ├── alloc.c          # Remote memory allocation/release via mm worker thread
-│       ├── thread.c         # Stop-and-hijack remote thread execution engine
-│       ├── stub.S           # Position-independent hijack stub (call, flag, park)
-│       ├── modbase.c        # Module base lookup by path substring
-│       ├── vma.c            # Direct kernel VMA permission query
-│       ├── vma_next.c       # Iterative VMA region enumeration
-│       ├── maps_next.c      # VMA enumeration with backing-file paths (/proc/maps replacement)
-│       └── proc_next.c      # Process enumeration with command names (/proc scan replacement)
-└── tools/
-    ├── Makefile             # C23 compiler driver for userspace utilities and libint3ctl.a
-    ├── include/
-    │   └── int3ctl.h        # Userspace tool definitions and command prototypes
-    ├── util/
-    │   ├── dev.c            # Device opening, validation, and shared write-request helper
-    │   ├── hex.c            # Hexadecimal string parser
-    │   └── dump.c           # Memory formatting and hexdump renderer
-    ├── lib/
-    │   └── api.c            # Thin libint3ctl wrappers (attach/read/write/read_u64/modbase)
-    ├── manualmap/
-    │   ├── mm.h             # Loader internal declarations
-    │   ├── io.c             # File pread helper
-    │   ├── elf.c            # Program header reader
-    │   ├── open.c           # ELF open/validate/minv helper
-    │   ├── dyn.c            # Dynamic section reader
-    │   ├── copy.c           # Segment stager
-    │   ├── hash.c           # GNU hash function
-    │   ├── lookup.c         # Remote libc symbol lookup
-    │   ├── off.c            # Vaddr-to-file-offset helper
-    │   ├── reloc.c          # Relocation engine
-    │   ├── sym.c            # File-local symbol offset lookup
-    │   ├── load.c           # PT_LOAD stager with W^X permissions
-    │   ├── run.c            # Load plus DT_INIT/INIT_ARRAY execution
-    │   ├── dlfcn.c          # Load via the target's own dlopen
-    │   ├── mprotectv.c      # Batched remote mprotect via syscall shellcode
-    │   ├── mprotect.c       # Single-range remote mprotect
-    │   └── testlib.c        # Selftest fixture .so source
-    ├── commands/
-    │   ├── cmd_version.c    # Driver version query
-    │   ├── cmd_stats.c      # Session telemetry query
-    │   ├── cmd_caps.c       # Capability bits query
-    │   ├── cmd_manualmap.c  # Remote alloc/free/manual-map/thread commands
-    │   ├── cmd_probe.c      # Address range accessibility prober
-    │   ├── cmd_read.c       # Remote memory hex reading
-    │   ├── cmd_write.c      # Remote memory raw writing
-    │   ├── cmd_force.c      # Privileged force write to code pages
-    │   ├── cmd_scalar.c     # Fast 64-bit scalar read/write
-    │   ├── cmd_deref.c      # Remote pointer dereference
-    │   ├── cmd_chain.c      # Multi-level pointer chain resolution
-    │   ├── cmd_scan.c       # In-kernel signature search
-    │   ├── cmd_scan_all.c   # Multi-match strided signature search
-    │   ├── cmd_vscan.c      # In-kernel integer value search
-    │   ├── cmd_cksum.c      # In-kernel range checksum
-    │   ├── cmd_copy.c       # In-kernel remote-to-remote copy
-    │   ├── cmd_vma.c        # Direct VMA metadata lookup
-    │   ├── cmd_modbase.c    # Module base lookup by name
-    │   ├── cmd_maps.c       # Full VMA region enumeration with backing paths
-    │   ├── cmd_procs.c      # Full process enumeration with command names
-    │   ├── cmd_write_verify.c # Write with in-kernel readback check
-    │   ├── cmd_bench.c      # Performance and throughput benchmark
-    │   └── cmd_selftest.c   # Selftest entry point (suites live in selftest/)
-    ├── selftest/
-    │   ├── ctx.h            # Shared selftest context and suite declarations
-    │   ├── run.c            # Layout check, target spawn, suite sequencing, teardown
-    │   ├── t_scalar.c       # Scalar and single read/write suites
-    │   ├── t_batch.c        # Batch engine and validation suites
-    │   ├── t_writes.c       # Force-write suites
-    │   ├── t_validate.c     # Argument validation suite
-    │   ├── t_query.c        # Probe/VMA/enumeration suites
-    │   ├── t_scan.c         # Pattern scan suites
-    │   ├── t_scanall.c      # Multi-match scan suites
-    │   ├── t_deref.c        # Pointer dereference suites
-    │   ├── t_verify.c       # Verified write and stress suites
-    │   ├── t_maps_procs.c   # Maps/process enumeration suites
-    │   ├── t_v5.c           # v5 ioctl suites (caps/modbase/chain/vscan/cksum/copy)
-    │   ├── t_mmap.c         # v6 suites (alloc/free, end-to-end fixture load)
-    │   ├── t_thread.c       # v7 suite (hijacked-thread fn execution)
-    │   └── t_lifecycle.c    # Detach/attach lifecycle suite
-    └── main.c               # CLI router and argument parser
-```
-
-### Build Artifact Isolation
-All compiler intermediate objects (`.o`, `.cmd`, `.mod.o`, `.symvers`, `.order`) are isolated in the `build/` directory:
-- `build/kernel/`: Kernel module intermediate build directory.
-- `build/tools/`: Userspace CLI intermediate object directory.
-- `bin/`: Final compiled binaries (`bin/int3drv.ko`, `bin/int3ctl`, `bin/libint3ctl.a`, `bin/libtestmap.so`).
+Linux kernel driver for remote process memory access. Character device at `/dev/int3`: batched reads and writes, in-kernel pattern and value scanning, VMA and process enumeration, remote allocation, ELF manual-map loading, and thread execution.
 
 ---
 
@@ -156,18 +11,11 @@ All compiler intermediate objects (`.o`, `.cmd`, `.mod.o`, `.symvers`, `.order`)
 ./build.sh
 ```
 
-### 2. Load the Kernel Module
-```bash
-make load
-# or manually:
-sudo insmod int3drv.ko
-```
-
 ### 2. Load & Verify Driver
 ```bash
 ./run.sh
 ```
-`./run.sh` checks if `int3drv` is already loaded and responsive at `/dev/int3`. If not running, it loads the kernel module with `sudo insmod bin/int3drv.ko`, verifies the device node, reports status, and leaves the driver running.
+`./run.sh` checks if `int3drv` is already loaded and responsive at `/dev/int3`. If not running, it loads the kernel module with `sudo insmod bin/int3drv.ko`, verifies the device node, reports status, and leaves the driver running. (`make load` / `sudo insmod` work too.)
 
 You can also execute commands directly via `run.sh`:
 ```bash
@@ -683,6 +531,148 @@ int3_modbase(fd, "libc", &base);
 ```
 
 Link with `bin/libint3ctl.a` and include `tools/include/int3ctl.h` plus the canonical `include/int3drv.h`. More wrappers graduate here when a second in-tree consumer needs them.
+
+---
+
+## Architecture & Codebase Layout
+
+The project enforces clean architecture where every file has a single, well-defined responsibility:
+
+```
+int3-kernel/
+├── build.sh                 # Complete build automation script (chmod +x)
+├── run.sh                   # Driver loader and command runner (chmod +x)
+├── test.sh                  # Verification suite runner: build check, selftest, live smoke (chmod +x)
+├── Makefile                 # Top-level make interface (supports DKMS)
+├── dkms.conf                # Dynamic Kernel Module Support configuration
+├── README.md                # Technical documentation and UAPI reference
+├── include/
+│   └── int3drv.h            # Canonical UAPI header (shared with userspace)
+├── src/
+│   ├── int3_internal.h      # Driver internal declarations and assertions
+│   ├── init/
+│   │   ├── device.c         # miscdevice registration and file operations table
+│   │   └── module.c         # Module lifecycle (module_init / module_exit)
+│   ├── core/
+│   │   ├── context.c        # File descriptor context allocation and bounce buffer
+│   │   ├── resolve.c        # Process resolution and task struct pinning
+│   │   ├── validate.c       # Address boundaries and arithmetic wrap checks
+│   │   └── dispatch.c       # Unlocked ioctl routing and session commands
+│   ├── mem/
+│   │   ├── copy_read.c      # Chunked remote-to-user read engine
+│   │   ├── copy_write.c     # Chunked user-to-remote write engine
+│   │   ├── rw.c             # Single-operation read/write handlers
+│   │   ├── write_verify.c   # Write with in-kernel readback comparison
+│   │   └── batch.c          # Multi-operation batch execution engine
+│   └── ops/
+│       ├── scalar.c         # Zero-allocation 32-bit and 64-bit scalar access
+│       ├── deref.c          # Single-level remote pointer dereference plus displacement
+│       ├── chain.c          # Multi-level pointer chain resolution
+│       ├── probe.c          # Non-destructive address accessibility probe
+│       ├── scan.c           # In-kernel sliding window pattern scanner
+│       ├── scan_all.c       # Multi-match strided pattern scanner
+│       ├── vscan.c          # In-kernel integer value scanner (eq/ne/gt/lt)
+│       ├── cksum.c          # In-kernel range checksum (FNV-1a)
+│       ├── copy.c           # In-kernel remote-to-remote copy
+│       ├── alloc.c          # Remote memory allocation/release via mm worker thread
+│       ├── thread.c         # Stop-and-hijack remote thread execution engine
+│       ├── stub.S           # Position-independent hijack stub (call, flag, park)
+│       ├── modbase.c        # Module base lookup by path substring
+│       ├── vma.c            # Direct kernel VMA permission query
+│       ├── vma_next.c       # Iterative VMA region enumeration
+│       ├── maps_next.c      # VMA enumeration with backing-file paths (/proc/maps replacement)
+│       └── proc_next.c      # Process enumeration with command names (/proc scan replacement)
+└── tools/
+    ├── Makefile             # C23 compiler driver for userspace utilities and libint3ctl.a
+    ├── include/
+    │   └── int3ctl.h        # Userspace tool definitions and command prototypes
+    ├── util/
+    │   ├── dev.c            # Device opening, validation, and shared write-request helper
+    │   ├── hex.c            # Hexadecimal string parser
+    │   └── dump.c           # Memory formatting and hexdump renderer
+    ├── lib/
+    │   └── api.c            # Thin libint3ctl wrappers (attach/read/write/read_u64/modbase)
+    ├── manualmap/
+    │   ├── mm.h             # Loader internal declarations
+    │   ├── io.c             # File pread helper
+    │   ├── elf.c            # Program header reader
+    │   ├── open.c           # ELF open/validate/minv helper
+    │   ├── dyn.c            # Dynamic section reader
+    │   ├── copy.c           # Segment stager
+    │   ├── hash.c           # GNU hash function
+    │   ├── lookup.c         # Remote libc symbol lookup
+    │   ├── off.c            # Vaddr-to-file-offset helper
+    │   ├── reloc.c          # Relocation engine
+    │   ├── sym.c            # File-local symbol offset lookup
+    │   ├── load.c           # PT_LOAD stager with W^X permissions
+    │   ├── run.c            # Load plus DT_INIT/INIT_ARRAY execution
+    │   ├── dlfcn.c          # Load via the target's own dlopen
+    │   ├── mprotectv.c      # Batched remote mprotect via syscall shellcode
+    │   ├── mprotect.c       # Single-range remote mprotect
+    │   └── testlib.c        # Selftest fixture .so source
+    ├── commands/
+    │   ├── cmd_version.c    # Driver version query
+    │   ├── cmd_stats.c      # Session telemetry query
+    │   ├── cmd_caps.c       # Capability bits query
+    │   ├── cmd_manualmap.c  # Remote alloc/free/manual-map/thread commands
+    │   ├── cmd_probe.c      # Address range accessibility prober
+    │   ├── cmd_read.c       # Remote memory hex reading
+    │   ├── cmd_write.c      # Remote memory raw writing
+    │   ├── cmd_force.c      # Privileged force write to code pages
+    │   ├── cmd_scalar.c     # Fast 64-bit scalar read/write
+    │   ├── cmd_deref.c      # Remote pointer dereference
+    │   ├── cmd_chain.c      # Multi-level pointer chain resolution
+    │   ├── cmd_scan.c       # In-kernel signature search
+    │   ├── cmd_scan_all.c   # Multi-match strided signature search
+    │   ├── cmd_vscan.c      # In-kernel integer value search
+    │   ├── cmd_cksum.c      # In-kernel range checksum
+    │   ├── cmd_copy.c       # In-kernel remote-to-remote copy
+    │   ├── cmd_vma.c        # Direct VMA metadata lookup
+    │   ├── cmd_modbase.c    # Module base lookup by name
+    │   ├── cmd_maps.c       # Full VMA region enumeration with backing paths
+    │   ├── cmd_procs.c      # Full process enumeration with command names
+    │   ├── cmd_write_verify.c # Write with in-kernel readback check
+    │   ├── cmd_bench.c      # Performance and throughput benchmark
+    │   └── cmd_selftest.c   # Selftest entry point (suites live in selftest/)
+    ├── selftest/
+    │   ├── ctx.h            # Shared selftest context and suite declarations
+    │   ├── run.c            # Layout check, target spawn, suite sequencing, teardown
+    │   ├── t_scalar.c       # Scalar and single read/write suites
+    │   ├── t_batch.c        # Batch engine and validation suites
+    │   ├── t_writes.c       # Force-write suites
+    │   ├── t_validate.c     # Argument validation suite
+    │   ├── t_query.c        # Probe/VMA/enumeration suites
+    │   ├── t_scan.c         # Pattern scan suites
+    │   ├── t_scanall.c      # Multi-match scan suites
+    │   ├── t_deref.c        # Pointer dereference suites
+    │   ├── t_verify.c       # Verified write and stress suites
+    │   ├── t_maps_procs.c   # Maps/process enumeration suites
+    │   ├── t_v5.c           # v5 ioctl suites (caps/modbase/chain/vscan/cksum/copy)
+    │   ├── t_mmap.c         # v6 suites (alloc/free, end-to-end fixture load)
+    │   ├── t_thread.c       # v7 suite (hijacked-thread fn execution)
+    │   └── t_lifecycle.c    # Detach/attach lifecycle suite
+    └── main.c               # CLI router and argument parser
+```
+
+### Build Artifact Isolation
+All compiler intermediate objects (`.o`, `.cmd`, `.mod.o`, `.symvers`, `.order`) are isolated in the `build/` directory:
+- `build/kernel/`: Kernel module intermediate build directory.
+- `build/tools/`: Userspace CLI intermediate object directory.
+- `bin/`: Final compiled binaries (`bin/int3drv.ko`, `bin/int3ctl`, `bin/libint3ctl.a`, `bin/libtestmap.so`).
+
+---
+
+## Compared to standard Linux interfaces
+
+| | `process_vm_*` / `ptrace` | `int3drv` |
+| :--- | :--- | :--- |
+| Call overhead | 1 syscall per operation or vector | 1 ioctl per batch of 256 operations |
+| Discovery hot path | 256 syscalls for 256 pointer reads | 1 syscall + 1 task lookup |
+| Scalar access | Needs userspace bounce pointers | Direct scalar register read/write |
+| Pattern scanning | Streams gigabytes to userspace | In-kernel sliding window scanner |
+| Executable/RO patching | Blocked without `mprotect` | `FOLL_FORCE` write through page protections |
+| VMA lookup | Parse `/proc/<pid>/maps` text | Direct kernel VMA tree query |
+| Tracer collisions | Blocked by other tracers | Page-table access, no ptrace involved |
 
 ---
 
